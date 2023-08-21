@@ -6,17 +6,18 @@ class BaseDataset(Dataset):
     """
     Define length and sampling method
     """
-    def __init__(self, root_dir, split='train', downsample=1.0):
+    def __init__(self, root_dir, split='train', downsample=1.0, scn_idx=0):
         self.root_dir = root_dir
         self.split = split
         self.downsample = downsample
+        self.scn_idx = scn_idx
 
     def read_intrinsics(self):
         raise NotImplementedError
 
     def __len__(self):
         if self.split.startswith('train'):
-            return 1000
+            return 1
         return len(self.poses)
 
     def __getitem__(self, idx):
@@ -40,5 +41,7 @@ class BaseDataset(Dataset):
                 sample['rgb'] = rays[:, :3]
                 if rays.shape[1] == 4: # HDR-NeRF data
                     sample['exposure'] = rays[0, 3] # same exposure for all rays
+
+        sample['scn_idx'] = self.scn_idx
 
         return sample

@@ -13,8 +13,8 @@ from .base import BaseDataset
 
 
 class ColmapDataset(BaseDataset):
-    def __init__(self, root_dir, split='train', downsample=1.0, **kwargs):
-        super().__init__(root_dir, split, downsample)
+    def __init__(self, root_dir, split='train', downsample=1.0, scn_idx=0, **kwargs):
+        super().__init__(root_dir, split, downsample, scn_idx)
 
         self.read_intrinsics()
 

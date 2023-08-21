@@ -1,8 +1,10 @@
 import torch
 from torch import nn
+from torch.nn.utils.stateless import functional_call
 import tinycudann as tcnn
 import vren
 from einops import rearrange
+import einops
 from .custom_functions import TruncExp
 import numpy as np
 
@@ -10,10 +12,14 @@ from .rendering import NEAR_DISTANCE
 
 
 class NGP(nn.Module):
-    def __init__(self, scale, rgb_act='Sigmoid'):
+    def __init__(self, scale, hparams, rgb_act='Sigmoid'):
         super().__init__()
 
         self.rgb_act = rgb_act
+        self.hyper = hparams.hyper
+        self.scene_embed_mode = hparams.embed_mode # "sum" or "concat"
+        self.scene_embed_size = hparams.embed_size
+        self.num_scene = hparams.num_scene
 
         # scene bounding box
         self.scale = scale
@@ -26,26 +32,47 @@ class NGP(nn.Module):
         self.cascades = max(1+int(np.ceil(np.log2(2*scale))), 1)
         self.grid_size = 128
         self.register_buffer('density_bitfield',
-            torch.zeros(self.cascades*self.grid_size**3//8, dtype=torch.uint8))
+            torch.ones(self.cascades*self.grid_size**3//8, dtype=torch.uint8) * 255)
 
         # constants
-        L = 16; F = 2; log2_T = 19; N_min = 16
-        b = np.exp(np.log(2048*scale/N_min)/(L-1))
+        L = hparams.L; F = hparams.F; log2_T = hparams.T; N_min = hparams.N_min; N_tables = hparams.N_tables
+        b = np.exp(np.log(hparams.N_max*scale/N_min)/(L-1))    # default scale value is 0.5
         print(f'GridEncoding: Nmin={N_min} b={b:.5f} F={F} T=2^{log2_T} L={L}')
 
-        self.xyz_encoder = \
-            tcnn.NetworkWithInputEncoding(
-                n_input_dims=3, n_output_dims=16,
+        self.feature_encoder = \
+            tcnn.Encoding(
+                n_input_dims=3, 
                 encoding_config={
-                    "otype": "Grid",
-	                "type": "Hash",
+                    "otype": f"{hparams.grid}Grid",    # HashGrid / MixedFeatureGrid
+                    "type": hparams.grid,     # Hash / MixedFeature
                     "n_levels": L,
                     "n_features_per_level": F,
                     "log2_hashmap_size": log2_T,
                     "base_resolution": N_min,
+                    "n_tables": N_tables,
                     "per_level_scale": b,
                     "interpolation": "Linear"
-                },
+                }
+            )
+        
+        # A hypernetwork generating feature grids' parameters
+        feat_modules = []
+        feat_modules += [nn.Linear(self.scene_embed_size, hparams.fgen_channels), nn.ReLU()]
+        for i in range(hparams.fgen_layers-2):
+            feat_modules += [nn.Linear(hparams.fgen_channels, hparams.fgen_channels), nn.ReLU()]
+        feat_modules += [nn.Linear(hparams.fgen_channels, self.feature_encoder.params.shape[0])]
+        self.feature_generator = nn.Sequential(*feat_modules)
+
+        # Scene embeddings
+        print(f'# of scenes={self.num_scene}')
+        self.register_parameter("scene_embed",
+                                nn.Parameter(torch.nn.init.uniform_(torch.zeros(self.num_scene, self.scene_embed_size, dtype=torch.float32)), True))
+        density_net_input_dims = self.feature_encoder.n_output_dims + (self.scene_embed_size if self.scene_embed_mode == "concat" else 0)
+
+        self.density_net = \
+            tcnn.Network(
+                n_input_dims=density_net_input_dims,
+                n_output_dims=16,
                 network_config={
                     "otype": "FullyFusedMLP",
                     "activation": "ReLU",
@@ -71,8 +98,8 @@ class NGP(nn.Module):
                     "otype": "FullyFusedMLP",
                     "activation": "ReLU",
                     "output_activation": self.rgb_act,
-                    "n_neurons": 64,
-                    "n_hidden_layers": 2,
+                    "n_neurons": hparams.rgb_channels,
+                    "n_hidden_layers": hparams.rgb_layers,
                 }
             )
 
@@ -91,7 +118,7 @@ class NGP(nn.Module):
                     )
                 setattr(self, f'tonemapper_net_{i}', tonemapper_net)
 
-    def density(self, x, return_feat=False):
+    def density(self, x, embed=None, return_feat=False):
         """
         Inputs:
             x: (N, 3) xyz in [-scale, scale]
@@ -101,7 +128,20 @@ class NGP(nn.Module):
             sigmas: (N)
         """
         x = (x-self.xyz_min)/(self.xyz_max-self.xyz_min)
-        h = self.xyz_encoder(x)
+        if self.hyper:
+            p = {'params': self.feature_generator(embed)}
+            feat = functional_call(self.feature_encoder, p, x)
+        else:
+            feat = self.feature_encoder(x)
+            
+        # scene embedding
+        if self.scene_embed_mode == "sum":
+            feat = feat + embed
+        elif self.scene_embed_mode == "concat":
+            feat = torch.cat([feat, einops.repeat(embed, 'v -> n v', n=x.shape[0])], dim=1)
+
+        h = self.density_net(feat)
+
         sigmas = TruncExp.apply(h[:, 0])
         if return_feat: return sigmas, h
         return sigmas
@@ -129,17 +169,19 @@ class NGP(nn.Module):
         rgbs = torch.cat(out, 1)
         return rgbs
 
-    def forward(self, x, d, **kwargs):
+    def forward(self, x, d, embed_idx, **kwargs):
         """
         Inputs:
             x: (N, 3) xyz in [-scale, scale]
             d: (N, 3) directions
+            embed_idx: (N)
 
         Outputs:
             sigmas: (N)
             rgbs: (N, 3)
         """
-        sigmas, h = self.density(x, return_feat=True)
+        embed = self.scene_embed[embed_idx] 
+        sigmas, h = self.density(x, embed, return_feat=True)
         d = d/torch.norm(d, dim=1, keepdim=True)
         d = self.dir_encoder((d+1)/2)
         rgbs = self.rgb_net(torch.cat([d, h], 1))
@@ -167,7 +209,7 @@ class NGP(nn.Module):
         return cells
 
     @torch.no_grad()
-    def sample_uniform_and_occupied_cells(self, M, density_threshold):
+    def sample_uniform_and_occupied_cells(self, M, density_threshold, scene=1):
         """
         Sample both M uniform and occupied cells (per cascade)
         occupied cells are sample from cells with density > @density_threshold
@@ -206,64 +248,71 @@ class NGP(nn.Module):
             img_wh: image width and height
             chunk: the chunk size to split the cells (to avoid OOM)
         """
-        N_cams = poses.shape[0]
         self.count_grid = torch.zeros_like(self.density_grid)
-        w2c_R = rearrange(poses[:, :3, :3], 'n a b -> n b a') # (N_cams, 3, 3)
-        w2c_T = -w2c_R@poses[:, :3, 3:] # (N_cams, 3, 1)
-        cells = self.get_all_cells()
-        for c in range(self.cascades):
-            indices, coords = cells[c]
-            for i in range(0, len(indices), chunk):
-                xyzs = coords[i:i+chunk]/(self.grid_size-1)*2-1
-                s = min(2**(c-1), self.scale)
-                half_grid_size = s/self.grid_size
-                xyzs_w = (xyzs*(s-half_grid_size)).T # (3, chunk)
-                xyzs_c = w2c_R @ xyzs_w + w2c_T # (N_cams, 3, chunk)
-                uvd = K @ xyzs_c # (N_cams, 3, chunk)
-                uv = uvd[:, :2]/uvd[:, 2:] # (N_cams, 2, chunk)
-                in_image = (uvd[:, 2]>=0)& \
-                           (uv[:, 0]>=0)&(uv[:, 0]<img_wh[0])& \
-                           (uv[:, 1]>=0)&(uv[:, 1]<img_wh[1])
-                covered_by_cam = (uvd[:, 2]>=NEAR_DISTANCE)&in_image # (N_cams, chunk)
-                # if the cell is visible by at least one camera
-                self.count_grid[c, indices[i:i+chunk]] = \
-                    count = covered_by_cam.sum(0)/N_cams
+        for scn_idx in range(self.num_scene):
+            N_cams = poses[scn_idx].shape[0]
+            w2c_R = rearrange(poses[scn_idx][:, :3, :3], 'n a b -> n b a') # (N_cams, 3, 3)
+            w2c_T = -w2c_R@poses[scn_idx][:, :3, 3:] # (N_cams, 3, 1)
+            cells = self.get_all_cells()
+            for c in range(self.cascades):
+                indices, coords = cells[c]
+                for i in range(0, len(indices), chunk):
+                    xyzs = coords[i:i+chunk]/(self.grid_size-1)*2-1
+                    s = min(2**(c-1), self.scale)
+                    half_grid_size = s/self.grid_size
+                    xyzs_w = (xyzs*(s-half_grid_size)).T # (3, chunk)
+                    xyzs_c = w2c_R @ xyzs_w + w2c_T # (N_cams, 3, chunk)
+                    uvd = K[scn_idx] @ xyzs_c # (N_cams, 3, chunk)
+                    uv = uvd[:, :2]/uvd[:, 2:] # (N_cams, 2, chunk)
+                    in_image = (uvd[:, 2]>=0)& \
+                            (uv[:, 0]>=0)&(uv[:, 0]<img_wh[0])& \
+                            (uv[:, 1]>=0)&(uv[:, 1]<img_wh[1])
+                    covered_by_cam = (uvd[:, 2]>=NEAR_DISTANCE)&in_image # (N_cams, chunk)
+                    # if the cell is visible by at least one camera
+                    self.count_grid[scn_idx, c, indices[i:i+chunk]] = \
+                        count = covered_by_cam.sum(0)/N_cams
 
-                too_near_to_cam = (uvd[:, 2]<NEAR_DISTANCE)&in_image # (N, chunk)
-                # if the cell is too close (in front) to any camera
-                too_near_to_any_cam = too_near_to_cam.any(0)
-                # a valid cell should be visible by at least one camera and not too close to any camera
-                valid_mask = (count>0)&(~too_near_to_any_cam)
-                self.density_grid[c, indices[i:i+chunk]] = \
-                    torch.where(valid_mask, 0., -1.)
+                    too_near_to_cam = (uvd[:, 2]<NEAR_DISTANCE)&in_image # (N, chunk)
+                    # if the cell is too close (in front) to any camera
+                    too_near_to_any_cam = too_near_to_cam.any(0)
+                    # a valid cell should be visible by at least one camera and not too close to any camera
+                    valid_mask = (count>0)&(~too_near_to_any_cam)
+                    self.density_grid[scn_idx, c, indices[i:i+chunk]] = \
+                        torch.where(valid_mask, 0., -1.)
 
     @torch.no_grad()
-    def update_density_grid(self, density_threshold, warmup=False, decay=0.95, erode=False):
-        density_grid_tmp = torch.zeros_like(self.density_grid)
-        if warmup: # during the first steps
-            cells = self.get_all_cells()
-        else:
-            cells = self.sample_uniform_and_occupied_cells(self.grid_size**3//4,
-                                                           density_threshold)
-        # infer sigmas
-        for c in range(self.cascades):
-            indices, coords = cells[c]
-            s = min(2**(c-1), self.scale)
-            half_grid_size = s/self.grid_size
-            xyzs_w = (coords/(self.grid_size-1)*2-1)*(s-half_grid_size)
-            # pick random position in the cell by adding noise in [-hgs, hgs]
-            xyzs_w += (torch.rand_like(xyzs_w)*2-1) * half_grid_size
-            density_grid_tmp[c, indices] = self.density(xyzs_w)
+    def update_density_grid(self, scn_idx, density_threshold, warmup=False, decay=0.95, erode=False):
+        N_dbits_per_scene = self.cascades*self.grid_size**3//8
 
-        if erode:
-            # My own logic. decay more the cells that are visible to few cameras
-            decay = torch.clamp(decay**(1/self.count_grid), 0.1, 0.95)
-        self.density_grid = \
-            torch.where(self.density_grid<0,
-                        self.density_grid,
-                        torch.maximum(self.density_grid*decay, density_grid_tmp))
+        for scn_idx in range(self.num_scene):
+            density_grid_tmp = torch.zeros_like(self.density_grid[scn_idx])
+            if warmup: # during the first steps
+                cells = self.get_all_cells()
+            else:
+                cells = self.sample_uniform_and_occupied_cells(self.grid_size**3//4,
+                                                            density_threshold,
+                                                            scene=scn_idx)
+            # infer sigmas
+            for c in range(self.cascades):
+                indices, coords = cells[c]
+                s = min(2**(c-1), self.scale)
+                half_grid_size = s/self.grid_size
+                xyzs_w = (coords/(self.grid_size-1)*2-1)*(s-half_grid_size)
+                # pick random position in the cell by adding noise in [-hgs, hgs]
+                xyzs_w += (torch.rand_like(xyzs_w)*2-1) * half_grid_size
+                embed_idxs = torch.zeros(xyzs_w.shape[0], dtype=torch.int, device=self.density_grid.device) + scn_idx
+                embeds = self.scene_embed.index_select(0, embed_idxs)
+                density_grid_tmp[c, indices] = self.density(xyzs_w, embeds)
 
-        mean_density = self.density_grid[self.density_grid>0].mean().item()
+            if erode:
+                # My own logic. decay more the cells that are visible to few cameras
+                decay = torch.clamp(decay**(1/self.count_grid[scn_idx]), 0.1, 0.95)
+            self.density_grid[scn_idx] = \
+                torch.where(self.density_grid[scn_idx]<0,
+                            self.density_grid[scn_idx],
+                            torch.maximum(self.density_grid[scn_idx]*decay, density_grid_tmp))
 
-        vren.packbits(self.density_grid, min(mean_density, density_threshold),
-                      self.density_bitfield)
+            mean_density = self.density_grid[scn_idx, self.density_grid[scn_idx]>0].mean().item()
+
+            vren.packbits(self.density_grid[scn_idx], min(mean_density, density_threshold),
+                        self.density_bitfield[scn_idx*N_dbits_per_scene:(scn_idx+1)*N_dbits_per_scene])

@@ -9,7 +9,7 @@ NEAR_DISTANCE = 0.01
 
 
 @torch.cuda.amp.autocast()
-def render(model, rays_o, rays_d, **kwargs):
+def render(model, rays_o, rays_d, embed_idx, **kwargs):
     """
     Render rays by
     1. Compute the intersection of the rays with the scene bounding box
@@ -33,7 +33,7 @@ def render(model, rays_o, rays_d, **kwargs):
     else:
         render_func = __render_rays_train
 
-    results = render_func(model, rays_o, rays_d, hits_t, **kwargs)
+    results = render_func(model, rays_o, rays_d, embed_idx, hits_t, **kwargs)
     for k, v in results.items():
         if kwargs.get('to_cpu', False):
             v = v.cpu()
@@ -44,7 +44,7 @@ def render(model, rays_o, rays_d, **kwargs):
 
 
 @torch.no_grad()
-def __render_rays_test(model, rays_o, rays_d, hits_t, **kwargs):
+def __render_rays_test(model, rays_o, rays_d, embed_idx, hits_t, **kwargs):
     """
     Render rays by
 
@@ -93,7 +93,7 @@ def __render_rays_test(model, rays_o, rays_d, hits_t, **kwargs):
 
         sigmas = torch.zeros(len(xyzs), device=device)
         rgbs = torch.zeros(len(xyzs), 3, device=device)
-        sigmas[valid_mask], _rgbs = model(xyzs[valid_mask], dirs[valid_mask], **kwargs)
+        sigmas[valid_mask], _rgbs = model(xyzs[valid_mask], dirs[valid_mask], embed_idx, **kwargs)
         rgbs[valid_mask] = _rgbs.float()
         sigmas = rearrange(sigmas, '(n1 n2) -> n1 n2', n2=N_samples)
         rgbs = rearrange(rgbs, '(n1 n2) c -> n1 n2 c', n2=N_samples)
@@ -118,7 +118,7 @@ def __render_rays_test(model, rays_o, rays_d, hits_t, **kwargs):
     return results
 
 
-def __render_rays_train(model, rays_o, rays_d, hits_t, **kwargs):
+def __render_rays_train(model, rays_o, rays_d, embed_idx, hits_t, **kwargs):
     """
     Render rays by
     1. March the rays along their directions, querying @density_bitfield
@@ -142,7 +142,7 @@ def __render_rays_train(model, rays_o, rays_d, hits_t, **kwargs):
     for k, v in kwargs.items(): # supply additional inputs, repeated per ray
         if isinstance(v, torch.Tensor):
             kwargs[k] = torch.repeat_interleave(v[rays_a[:, 0]], rays_a[:, 2], 0)
-    sigmas, rgbs = model(xyzs, dirs, **kwargs)
+    sigmas, rgbs = model(xyzs, dirs, embed_idx, **kwargs)
 
     (results['vr_samples'], results['opacity'],
     results['depth'], results['rgb'], results['ws']) = \
