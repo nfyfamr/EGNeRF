@@ -10,7 +10,7 @@ def get_opts():
                         choices=['nerf', 'nsvf', 'colmap', 'nerfpp', 'rtmv', 'srn'],
                         help='which dataset to train/test')
     parser.add_argument('--split', type=str, default='train',
-                        choices=['train', 'trainval', 'trainvaltest'],
+                        choices=['train', 'trainval', 'trainvaltest', 'test_opt'],
                         help='use which split to train')
     parser.add_argument('--downsample', type=float, default=1.0,
                         help='downsample factor (<=1.0) for the images')
@@ -109,5 +109,9 @@ def get_opts():
                         help='feature generator network channels')
     parser.add_argument('--fgen_layers', type=int, default=2,
                         help='feature generator network layers')
+    
+    # optimization config
+    parser.add_argument('--view_idxs', nargs='+', type=int, default=None,
+                        help='view indices for test optimization')
 
     return parser.parse_args()

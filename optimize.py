@@ -69,6 +69,8 @@ class NeRFSystem(LightningModule):
         
         self.num_scene = len(self.root_dirs)
         hparams.num_scene = self.num_scene
+        if hparams.view_idxs is None: hparams.view_idxs = [0]
+        hparams.num_views = self.num_views = len(hparams.view_idxs)
 
         rendering.MAX_SAMPLES = self.hparams.max_samples
 
@@ -126,7 +128,8 @@ class NeRFSystem(LightningModule):
         for scn_idx, root_dir in enumerate(self.root_dirs):
             kwargs = {'root_dir': root_dir,
                     'downsample': self.hparams.downsample,
-                    'scn_idx': scn_idx}
+                    'scn_idx': scn_idx,
+                    'view_idxs': self.hparams.view_idxs}
             ds = dataset(split=self.hparams.split, **kwargs)
             ds.batch_size = self.hparams.batch_size
             ds.ray_sampling_strategy = self.hparams.ray_sampling_strategy
@@ -147,8 +150,8 @@ class NeRFSystem(LightningModule):
             kwargs = {'root_dir': root_dir,
                     'downsample': self.hparams.downsample,
                     'scn_idx': scn_idx,
-                    'view_idxs': [48]}
-            test_datasets.append(dataset(split='val', **kwargs))
+                    'view_idxs': self.hparams.view_idxs}
+            test_datasets.append(dataset(split='test', **kwargs))
         self.test_dataset = torch.utils.data.ConcatDataset(test_datasets)
         self.test_dataset.ds_sizes = [ds.poses.shape[0] for ds in test_datasets]
 
@@ -175,10 +178,8 @@ class NeRFSystem(LightningModule):
 
         net_params = []
         for n, p in self.named_parameters():
-            if self.hparams.hyper:
-                if n not in ['dR', 'dT', 'model.feature_encoder.params']: net_params += [p]
-            else:
-                if n not in ['dR', 'dT']: net_params += [p]
+            if n in ['model.scene_embed']:
+                net_params += [p]
 
         opts = []
         self.net_opt = FusedAdam(net_params, self.hparams.lr, eps=1e-15)
@@ -237,7 +238,7 @@ class NeRFSystem(LightningModule):
     def on_validation_start(self):
         torch.cuda.empty_cache()
         if not self.hparams.no_save_test:
-            self.val_dir = f'results/{self.hparams.dataset_name}/{self.hparams.exp_name}'
+            self.val_dir = f'results/{self.hparams.dataset_name}/{self.hparams.exp_name}_opt'
             os.makedirs(self.val_dir, exist_ok=True)
 
     def validation_step(self, batch, batch_nb):
@@ -257,10 +258,10 @@ class NeRFSystem(LightningModule):
         self.val_ssim(rgb_pred, rgb_gt)
         logs['ssim'] = self.val_ssim.compute()
         self.val_ssim.reset()
-        
-        # if batch['img_idxs'] in self.hparams.view_idxs:
-        self.logger.experiment.add_images(f'test/psnr/scene_{batch["scn_idx"]}', torch.concat([rgb_pred, rgb_gt]), 0)
-        
+
+        if batch['img_idxs'] in self.hparams.view_idxs:
+            self.logger.experiment.add_images(f'test/psnr/scene_{batch["scn_idx"]}', torch.concat([rgb_pred, rgb_gt]), 0)
+
         if self.hparams.eval_lpips:
             self.val_lpips(torch.clip(rgb_pred*2-1, -1, 1),
                            torch.clip(rgb_gt*2-1, -1, 1))
@@ -306,19 +307,35 @@ class NeRFSystem(LightningModule):
         items = super().get_progress_bar_dict()
         items.pop("v_num", None)
         return items
+    
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        state_dict = checkpoint["state_dict"]
+        model_state_dict = self.state_dict()
+        is_changed = False
+        for k in state_dict:
+            if k in model_state_dict:
+                if state_dict[k].shape != model_state_dict[k].shape:
+                    print(f"Skip loading parameter: {k}, "
+                                f"required shape: {model_state_dict[k].shape}, "
+                                f"loaded shape: {state_dict[k].shape}")
+                    state_dict[k] = model_state_dict[k]
+                    is_changed = True
+            else:
+                print(f"Dropping parameter {k}")
+                is_changed = True
+
+        if is_changed:
+            checkpoint.pop("optimizer_states", None)
 
 
 if __name__ == '__main__':
     hparams = get_opts()
-    if hparams.val_only and (not hparams.ckpt_path):
-        raise ValueError('You need to provide a @ckpt_path for validation!')
+    if not hparams.ckpt_path:
+        raise ValueError('You need to provide a @ckpt_path for optimization!')
 
-    if hparams.val_only:
-        system = NeRFSystem.load_from_checkpoint(hparams.ckpt_path, strict=False, hparams=hparams)
-    else:
-        system = NeRFSystem(hparams)
+    system = NeRFSystem.load_from_checkpoint(hparams.ckpt_path, strict=False, hparams=hparams)
 
-    ckpt_cb = ModelCheckpoint(dirpath=f'ckpts/{hparams.dataset_name}/{hparams.exp_name}',
+    ckpt_cb = ModelCheckpoint(dirpath=f'ckpts/{hparams.dataset_name}/{hparams.exp_name}_opt',
                               filename='{epoch:d}',
                               save_weights_only=True,
                               every_n_epochs=hparams.num_epochs,
@@ -327,7 +344,7 @@ if __name__ == '__main__':
     callbacks = [ckpt_cb, TQDMProgressBar(refresh_rate=1)]
 
     logger = TensorBoardLogger(save_dir=f"logs/{hparams.dataset_name}",
-                               name=hparams.exp_name,
+                               name=hparams.exp_name+'_opt',
                                default_hp_metric=False)
 
     trainer = Trainer(max_epochs=hparams.num_epochs if hparams.num_epochs else 1,
@@ -347,9 +364,9 @@ if __name__ == '__main__':
 
     if not hparams.val_only: # save slimmed ckpt for the last epoch
         ckpt_ = \
-            slim_ckpt(f'ckpts/{hparams.dataset_name}/{hparams.exp_name}/epoch={hparams.num_epochs-1}.ckpt',
+            slim_ckpt(f'ckpts/{hparams.dataset_name}/{hparams.exp_name}_opt/epoch={hparams.num_epochs-1}.ckpt',
                       save_poses=hparams.optimize_ext)
-        torch.save(ckpt_, f'ckpts/{hparams.dataset_name}/{hparams.exp_name}/epoch={hparams.num_epochs-1}_slim.ckpt')
+        torch.save(ckpt_, f'ckpts/{hparams.dataset_name}/{hparams.exp_name}_opt/epoch={hparams.num_epochs-1}_slim.ckpt')
 
     if (not hparams.no_save_test) and \
        hparams.dataset_name=='nsvf' and \

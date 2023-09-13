@@ -33,20 +33,25 @@ class SRNDataset(BaseDataset):
         self.directions = get_ray_directions(h, w, self.K)
         self.img_wh = (w, h)
 
-    def read_meta(self, split):
+    def read_meta(self, split, view_idxs=None):
         self.rays = []
         self.poses = []
 
         img_paths = sorted(glob.glob(os.path.join(self.root_dir, 'rgb/*')))
         poses = sorted(glob.glob(os.path.join(self.root_dir, 'pose/*.txt')))
 
-        # use every 8th image as test set
-        if split=='train':
-            img_paths = [x for i, x in enumerate(img_paths) if i%8!=0]
-            poses = np.array([x for i, x in enumerate(poses) if i%8!=0])
-        elif split=='test':
-            img_paths = [x for i, x in enumerate(img_paths) if i%8==0]
-            poses = np.array([x for i, x in enumerate(poses) if i%8==0])
+        if split in ['test_opt', 'test', 'val']:
+            # check view_idxs is in valid range
+            if min(view_idxs) < 0 or max(view_idxs) >= len(img_paths):
+                print(f'The given view indices {view_idxs} are out of range [0,{len(img_paths)-1}]!')
+        
+            # use view_idxs images as test_opt set
+            if split in ['test_opt', 'val']:
+                img_paths = [x for i, x in enumerate(img_paths) if i in view_idxs]
+                poses = np.array([x for i, x in enumerate(poses) if i in view_idxs])
+            elif split=='test':
+                img_paths = [x for i, x in enumerate(img_paths) if i not in view_idxs]
+                poses = np.array([x for i, x in enumerate(poses) if i not in view_idxs])
 
         print(f'Loading {len(img_paths)} {split} images ({self.scn_idx} th) ...')
         for img_path, pose in tqdm(zip(img_paths, poses)):

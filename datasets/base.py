@@ -17,11 +17,11 @@ class BaseDataset(Dataset):
 
     def __len__(self):
         if self.split.startswith('train'):
-            return 1
+            return 5    # 50 images per ShapeNet_SRN object
         return len(self.poses)
 
     def __getitem__(self, idx):
-        if self.split.startswith('train'):
+        if self.split.startswith('train') or self.split.startswith('test_opt'):
             # training pose is retrieved in train.py
             if self.ray_sampling_strategy == 'all_images': # randomly select images
                 img_idxs = np.random.choice(len(self.poses), self.batch_size)
