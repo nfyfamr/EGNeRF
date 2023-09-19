@@ -17,6 +17,8 @@ class NGP(nn.Module):
 
         self.rgb_act = rgb_act
         self.hyper = hparams.hyper
+        self.embed_bias_feat = hparams.embed_bias_feat
+        self.embed_bias_color = hparams.embed_bias_color
         self.scene_embed_mode = hparams.embed_mode # "sum" or "concat"
         self.scene_embed_size = hparams.embed_size
         self.num_scene = hparams.num_scene
@@ -68,7 +70,15 @@ class NGP(nn.Module):
         self.register_parameter("scene_embed",
                                 nn.Parameter(torch.nn.init.uniform_(torch.zeros(self.num_scene, self.scene_embed_size, dtype=torch.float32)), True))
         density_net_input_dims = self.feature_encoder.n_output_dims + (self.scene_embed_size if self.scene_embed_mode == "concat" else 0)
-
+        
+        # Embedding bias
+        if hparams.embed_bias_feat:
+            self.register_parameter("scene_embed_bias_feat",
+                                nn.Parameter(torch.nn.init.uniform_(torch.zeros(self.num_scene, self.scene_embed_size, dtype=torch.float32)), True))
+        if hparams.embed_bias_color:
+            self.register_parameter("scene_embed_bias_color",
+                                nn.Parameter(torch.nn.init.uniform_(torch.zeros(self.num_scene, self.scene_embed_size, dtype=torch.float32)), True))
+        
         self.density_net = \
             tcnn.Network(
                 n_input_dims=density_net_input_dims,
@@ -118,7 +128,7 @@ class NGP(nn.Module):
                     )
                 setattr(self, f'tonemapper_net_{i}', tonemapper_net)
 
-    def density(self, x, embed=None, return_feat=False):
+    def density(self, x, embed=None, return_feat=False, embed_bias_feat=None, embed_bias_color=None):
         """
         Inputs:
             x: (N, 3) xyz in [-scale, scale]
@@ -129,16 +139,25 @@ class NGP(nn.Module):
         """
         x = (x-self.xyz_min)/(self.xyz_max-self.xyz_min)
         if self.hyper:
-            p = {'params': self.feature_generator(embed)}
+            if self.embed_bias_feat:
+                p = {'params': self.feature_generator(embed+embed_bias_feat)}
+            else:
+                p = {'params': self.feature_generator(embed)}
             feat = functional_call(self.feature_encoder, p, x)
         else:
             feat = self.feature_encoder(x)
             
         # scene embedding
         if self.scene_embed_mode == "sum":
-            feat = feat + embed
+            if self.embed_bias_color:
+                feat = feat + embed + embed_bias_color
+            else:
+                feat = feat + embed
         elif self.scene_embed_mode == "concat":
-            feat = torch.cat([feat, einops.repeat(embed, 'v -> n v', n=x.shape[0])], dim=1)
+            if self.embed_bias_color:
+                feat = torch.cat([feat, einops.repeat(embed+embed_bias_color, 'v -> n v', n=x.shape[0])], dim=1)
+            else:
+                feat = torch.cat([feat, einops.repeat(embed, 'v -> n v', n=x.shape[0])], dim=1)
 
         h = self.density_net(feat)
 
@@ -180,8 +199,10 @@ class NGP(nn.Module):
             sigmas: (N)
             rgbs: (N, 3)
         """
-        embed = self.scene_embed[embed_idx] 
-        sigmas, h = self.density(x, embed, return_feat=True)
+        embed = self.scene_embed[embed_idx]
+        embed_bias_feat = self.scene_embed_bias_feat[embed_idx] if self.embed_bias_feat else None
+        embed_bias_color = self.scene_embed_bias_color[embed_idx] if self.embed_bias_color else None
+        sigmas, h = self.density(x, embed, return_feat=True, embed_bias_feat=embed_bias_feat, embed_bias_color=embed_bias_color)
         d = d/torch.norm(d, dim=1, keepdim=True)
         d = self.dir_encoder((d+1)/2)
         rgbs = self.rgb_net(torch.cat([d, h], 1))

@@ -11,3 +11,4 @@ scipy
 pymcubes
 trimesh
 dearpygui
+Pillow==9.5.0

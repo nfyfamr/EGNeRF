@@ -27,6 +27,10 @@ def get_opts():
                         0 to disable (default), to enable,
                         a good value is 1e-3 for real scene and 1e-2 for synthetic scene
                         ''')
+    parser.add_argument('--bce_loss_w', type=float, default=0,
+                        help='''weight of bce loss (see losses.py),
+                        0 to disable (default)
+                        ''')
 
     # training options
     parser.add_argument('--batch_size', type=int, default=8192,
@@ -45,6 +49,10 @@ def get_opts():
                         help='learning rate')
     parser.add_argument('--lr_decay', type=float, default=1e-2,
                         help='learning rate decay; final learning rate: lr*lr_decay')
+    parser.add_argument('--emb_lr', type=float, default=1e-2,
+                        help='learning rate for embedding vector')
+    parser.add_argument('--emb_lr_decay', type=float, default=1e-2,
+                        help='learning rate decay for embedding vector; final learning rate: emb_lr*emb_lr_decay')
     # experimental training options
     parser.add_argument('--optimize_ext', action='store_true', default=False,
                         help='whether to optimize extrinsics')
@@ -113,5 +121,9 @@ def get_opts():
     # optimization config
     parser.add_argument('--view_idxs', nargs='+', type=int, default=None,
                         help='view indices for test optimization')
+    parser.add_argument('--embed_bias_feat', action='store_true', default=False,
+                        help='add bias to embedding')
+    parser.add_argument('--embed_bias_color', action='store_true', default=False,
+                        help='add bias to embedding')
 
     return parser.parse_args()

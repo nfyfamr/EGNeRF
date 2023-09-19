@@ -74,7 +74,8 @@ class NeRFSystem(LightningModule):
 
         rendering.MAX_SAMPLES = self.hparams.max_samples
 
-        self.loss = NeRFLoss(lambda_distortion=self.hparams.distortion_loss_w)
+        self.loss = NeRFLoss(lambda_distortion=self.hparams.distortion_loss_w,
+                            lambda_bce=self.hparams.bce_loss_w)
         self.train_psnr = PeakSignalNoiseRatio(data_range=1)
         self.val_psnr = PeakSignalNoiseRatio(data_range=1)
         self.val_ssim = StructuralSimilarityIndexMeasure(data_range=1)
@@ -176,21 +177,21 @@ class NeRFSystem(LightningModule):
 
         load_ckpt(self.model, self.hparams.weight_path)
 
-        net_params = []
+        emb_params = []
         for n, p in self.named_parameters():
-            if n in ['model.scene_embed']:
-                net_params += [p]
+            if n in ['model.scene_embed', 'model.scene_embed_bias_feat', 'model.scene_embed_bias_color']:
+                emb_params += [p]
 
         opts = []
-        self.net_opt = FusedAdam(net_params, self.hparams.lr, eps=1e-15)
-        opts += [self.net_opt]
+        self.emb_opt = FusedAdam(emb_params, self.hparams.emb_lr, eps=1e-15)
+        opts += [self.emb_opt]
         if self.hparams.optimize_ext:
             opts += [FusedAdam([self.dR, self.dT], 1e-6)] # learning rate is hard-coded
-        net_sch = CosineAnnealingLR(self.net_opt,
+        emb_sch = CosineAnnealingLR(self.emb_opt,
                                     self.hparams.num_epochs-1,
-                                    self.hparams.lr*self.hparams.lr_decay)
+                                    self.hparams.emb_lr*self.hparams.emb_lr_decay)
 
-        return opts, [net_sch]
+        return opts, [emb_sch]
 
     def train_dataloader(self):
         return self.dataloader_train
@@ -225,7 +226,7 @@ class NeRFSystem(LightningModule):
 
         with torch.no_grad():
             self.train_psnr(results['rgb'], batch['rgb'])
-        self.log('lr', self.net_opt.param_groups[0]['lr'])
+        self.log('lr/emb_lr', self.emb_opt.param_groups[0]['lr'])
         self.log('train/loss', loss)
         # ray marching samples per ray (occupied space on the ray)
         self.log('train/rm_s', results['rm_samples']/len(batch['rgb']), True)

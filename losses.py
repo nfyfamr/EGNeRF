@@ -38,11 +38,13 @@ class DistortionLoss(torch.autograd.Function):
 
 
 class NeRFLoss(nn.Module):
-    def __init__(self, lambda_opacity=1e-3, lambda_distortion=1e-3):
+    def __init__(self, lambda_opacity=1e-3, lambda_distortion=1e-3, lambda_bce=1e-3):
         super().__init__()
 
         self.lambda_opacity = lambda_opacity
         self.lambda_distortion = lambda_distortion
+        self.lambda_bce = lambda_bce
+        self.BCELoss = nn.BCEWithLogitsLoss(reduction='none')
 
     def forward(self, results, target, **kwargs):
         d = {}
@@ -56,5 +58,10 @@ class NeRFLoss(nn.Module):
             d['distortion'] = self.lambda_distortion * \
                 DistortionLoss.apply(results['ws'], results['deltas'],
                                      results['ts'], results['rays_a'])
+            
+        if self.lambda_bce > 0:
+            d['bce'] = self.lambda_bce * \
+                self.BCELoss((1-results['rgb']).mean(1), ((1-target['rgb']).sum(1)>0).float())
+                # self.BCELoss(torch.where(results['rgb'].mean(1)<1, results['rgb'].mean(1), 0), ((1-target['rgb']).sum(1)>0).float())
 
         return d
